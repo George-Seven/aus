@@ -509,8 +509,25 @@ void dMeetingHud_CastVote(MeetingHud* __this, PlayerId playerId, PlayerId suspec
     if (State.ShowHookLogs) Log.HookDebug("Hook dLogicOptions_GetAnonymousVotes executed", false);
     if (!State.PanicMode && IsHost() && !State.VoteImmunePlayers.empty()) {
         if (std::find(State.VoteImmunePlayers.begin(), State.VoteImmunePlayers.end(), suspectIdx.Value) != State.VoteImmunePlayers.end()) {
-            auto it = State.VoteRedirectTargets.find(suspectIdx.Value);
-            suspectIdx = (PlayerId)((it != State.VoteRedirectTargets.end()) ? it->second : 253);
+            std::unordered_map<Game::VotedFor, int> voteCounts;
+            for (auto playerState : il2cpp::Array(__this->fields.playerStates)) {
+                if (!playerState || playerState->fields._PlayerId_k__BackingField.Value == playerId.Value) continue;
+                auto votedFor = playerState->fields._VotedForId_k__BackingField.Value;
+                if (votedFor == Game::SkippedVote || votedFor < Game::DeadVote)
+                    ++voteCounts[votedFor];
+            }
+
+            int highestOtherVotes = 0;
+            for (const auto& [target, count] : voteCounts) {
+                if (target != suspectIdx.Value && count > highestOtherVotes)
+                    highestOtherVotes = count;
+            }
+
+         
+            if (voteCounts[suspectIdx.Value] + 1 > highestOtherVotes) {
+                auto it = State.VoteRedirectTargets.find(suspectIdx.Value);
+                suspectIdx.Value = (it != State.VoteRedirectTargets.end()) ? it->second : Game::SkippedVote;
+            }
         }
     }
     MeetingHud_CastVote(__this, playerId, suspectIdx, method);
