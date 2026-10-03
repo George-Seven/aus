@@ -24,6 +24,41 @@ struct PlayerActivityInfo {
 
 std::unordered_map<int, PlayerActivityInfo> playerActivityMap;
 
+namespace FirstMeetingCooldown
+{
+    constexpr float Duration = 45.0f;
+
+    // Absolute Unity time at which the first-meeting cooldown expires.
+    static float BlockUntil = -1.0f;
+
+    inline void Start()
+    {
+        if (!State.FirstMeetingCooldown)
+        {
+            BlockUntil = -1.0f;
+            return;
+        }
+
+        BlockUntil = app::Time_get_time(nullptr) + Duration;
+    }
+
+    inline bool IsBlocked()
+    {
+        if (!State.FirstMeetingCooldown)
+            return false;
+
+        if (BlockUntil < 0.0f)
+            return false;
+
+        return app::Time_get_time(nullptr) < BlockUntil;
+    }
+
+    inline void Reset()
+    {
+        BlockUntil = -1.0f;
+    }
+}
+
 void dPlayerControl_CompleteTask(PlayerControl* __this, uint32_t idx, MethodInfo* method) {
     if (State.ShowHookLogs) Log.HookDebug("Hook dPlayerControl_CompleteTask executed", false);
     try {
@@ -939,6 +974,13 @@ void dPlayerControl_OnGameStart(PlayerControl* __this, MethodInfo* method) {
     try {
         State.GameLoaded = true;
 
+        // Start the 45-second emergency-meeting cooldown.
+        // Only the host needs to enforce it.
+        if (IsHost())
+        {
+            FirstMeetingCooldown::Start();
+        }
+
         if (State.Overflow && __this == *Game::pLocalPlayer &&
             convert_from_string(GetPlayerOutfit(GetPlayerData(__this))->fields.NamePlateId) == "missing") {
             PlayerControl_RpcSetNamePlate(__this, convert_to_string(State.OverflowCachedNamePlate), NULL);
@@ -1201,6 +1243,20 @@ void dPlayerControl_CmdCheckRevertShapeshift(PlayerControl* __this, bool animate
 void dPlayerControl_StartMeeting(PlayerControl* __this, NetworkedPlayerInfo* target, MethodInfo* method)
 {
     if (State.ShowHookLogs) Log.HookDebug("Hook dPlayerControl_StartMeeting executed", false);
+
+    // First 45 seconds:
+    //
+    // target == nullptr -> emergency/button meeting
+    // target != nullptr -> dead-body report
+    //
+    // Therefore ONLY the emergency button is blocked.
+    if (IsHost() &&
+        target == nullptr &&
+        FirstMeetingCooldown::IsBlocked())
+    {
+        return;
+    }
+
     State.BlinkPlayersTab = true;
     if (Object_1_IsNull((Object_1*)*Game::pShipStatus)) return;
     try {
@@ -1264,12 +1320,22 @@ void dPlayerControl_HandleRpc(PlayerControl* __this, uint8_t callId, MessageRead
         if (Object_1_IsNull((Object_1*)*Game::pShipStatus) && (callId == (uint8_t)RpcCalls__Enum::ReportDeadBody || callId == (uint8_t)RpcCalls__Enum::StartMeeting ||
                 callId == (uint8_t)RpcCalls__Enum::CloseDoorsOfType || callId == (uint8_t)RpcCalls__Enum::UpdateSystem))
             return;
+        
         if (IsHost() && ((((!State.PanicMode && State.DisableMeetings) || (State.BattleRoyale || State.TaskSpeedrun)) &&
             (callId == (uint8_t)RpcCalls__Enum::ReportDeadBody || callId == (uint8_t)RpcCalls__Enum::StartMeeting)) ||
             ((State.DisableSabotages || (State.BattleRoyale || State.TaskSpeedrun)) &&
                 ((callId == (uint8_t)RpcCalls__Enum::CloseDoorsOfType && State.mapType != Settings::MapType::Hq) || callId == (uint8_t)RpcCalls__Enum::UpdateSystem))))
             //we cannot prevent murderplayer because the player will force it
             return;
+        
+        // First 45 seconds: block emergency meetings only.
+        // Dead-body reports continue to work normally.
+        if (IsHost() &&
+            callId == (uint8_t)RpcCalls__Enum::StartMeeting &&
+            FirstMeetingCooldown::IsBlocked())
+        {
+            return;
+        }
         if (IsHost() && !State.PanicMode && callId == (uint8_t)RpcCalls__Enum::CloseDoorsOfType &&
             State.DisabledSabotageTypes.count((int)SystemTypes__Enum::Doors))
             return;
