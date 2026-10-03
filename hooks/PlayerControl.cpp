@@ -28,23 +28,35 @@ namespace FirstMeetingCooldown
 {
     constexpr float Duration = 45.0f;
 
-    // Absolute Unity time at which the first-meeting cooldown expires.
     static float BlockUntil = -1.0f;
+    static int32_t GameId = -1;
 
     inline void Start()
     {
-        if (!State.FirstMeetingCooldown)
+        if (!State.FirstMeetingCooldown || !IsHost())
         {
             BlockUntil = -1.0f;
+            GameId = -1;
             return;
         }
 
+        if (*Game::pAmongUsClient == nullptr)
+            return;
+
+        int32_t currentGameId = (*Game::pAmongUsClient)->fields._.GameId;
+
+        // OnGameStart is called for multiple PlayerControl objects.
+        // Only start the timer once for each game.
+        if (GameId == currentGameId && BlockUntil >= 0.0f)
+            return;
+
+        GameId = currentGameId;
         BlockUntil = app::Time_get_time(nullptr) + Duration;
     }
 
     inline bool IsBlocked()
     {
-        if (!State.FirstMeetingCooldown)
+        if (!State.FirstMeetingCooldown || !IsHost())
             return false;
 
         if (BlockUntil < 0.0f)
@@ -56,6 +68,7 @@ namespace FirstMeetingCooldown
     inline void Reset()
     {
         BlockUntil = -1.0f;
+        GameId = -1;
     }
 }
 
@@ -974,10 +987,9 @@ void dPlayerControl_OnGameStart(PlayerControl* __this, MethodInfo* method) {
     try {
         State.GameLoaded = true;
 
-        // Start the 45-second emergency-meeting cooldown.
-        // Only the host needs to enforce it.
-        if (IsHost())
-        {
+        // Start the host-side 45 second emergency-meeting cooldown.
+        // Start() internally makes sure it only starts once per game.
+        if (IsHost()) {
             FirstMeetingCooldown::Start();
         }
 
@@ -1243,23 +1255,21 @@ void dPlayerControl_CmdCheckRevertShapeshift(PlayerControl* __this, bool animate
 void dPlayerControl_StartMeeting(PlayerControl* __this, NetworkedPlayerInfo* target, MethodInfo* method)
 {
     if (State.ShowHookLogs) Log.HookDebug("Hook dPlayerControl_StartMeeting executed", false);
-
-    // First 45 seconds:
-    //
-    // target == nullptr -> emergency/button meeting
-    // target != nullptr -> dead-body report
-    //
-    // Therefore ONLY the emergency button is blocked.
-    if (IsHost() &&
-        target == nullptr &&
-        FirstMeetingCooldown::IsBlocked())
-    {
-        return;
-    }
-
     State.BlinkPlayersTab = true;
     if (Object_1_IsNull((Object_1*)*Game::pShipStatus)) return;
     try {
+
+        // First 45 seconds:
+        // block emergency/button meetings only.
+        // target == nullptr means this is an emergency meeting.
+        // Dead-body reports have a non-null target and remain allowed.
+        if (IsHost() &&
+            target == nullptr &&
+            FirstMeetingCooldown::IsBlocked())
+        {
+            return;
+        }
+
         if (!State.PanicMode && IsHost() && (State.DisableMeetings || (State.BattleRoyale || State.TaskSpeedrun))) {
             return;
         }
@@ -1321,21 +1331,22 @@ void dPlayerControl_HandleRpc(PlayerControl* __this, uint8_t callId, MessageRead
                 callId == (uint8_t)RpcCalls__Enum::CloseDoorsOfType || callId == (uint8_t)RpcCalls__Enum::UpdateSystem))
             return;
         
-        if (IsHost() && ((((!State.PanicMode && State.DisableMeetings) || (State.BattleRoyale || State.TaskSpeedrun)) &&
-            (callId == (uint8_t)RpcCalls__Enum::ReportDeadBody || callId == (uint8_t)RpcCalls__Enum::StartMeeting)) ||
-            ((State.DisableSabotages || (State.BattleRoyale || State.TaskSpeedrun)) &&
-                ((callId == (uint8_t)RpcCalls__Enum::CloseDoorsOfType && State.mapType != Settings::MapType::Hq) || callId == (uint8_t)RpcCalls__Enum::UpdateSystem))))
-            //we cannot prevent murderplayer because the player will force it
-            return;
-        
-        // First 45 seconds: block emergency meetings only.
-        // Dead-body reports continue to work normally.
+        // First 45 seconds:
+        // block emergency/button meeting RPCs from EVERY player.
+        // Do NOT block ReportDeadBody.
         if (IsHost() &&
             callId == (uint8_t)RpcCalls__Enum::StartMeeting &&
             FirstMeetingCooldown::IsBlocked())
         {
             return;
         }
+        
+        if (IsHost() && ((((!State.PanicMode && State.DisableMeetings) || (State.BattleRoyale || State.TaskSpeedrun)) &&
+            (callId == (uint8_t)RpcCalls__Enum::ReportDeadBody || callId == (uint8_t)RpcCalls__Enum::StartMeeting)) ||
+            ((State.DisableSabotages || (State.BattleRoyale || State.TaskSpeedrun)) &&
+                ((callId == (uint8_t)RpcCalls__Enum::CloseDoorsOfType && State.mapType != Settings::MapType::Hq) || callId == (uint8_t)RpcCalls__Enum::UpdateSystem))))
+            //we cannot prevent murderplayer because the player will force it
+            return;
         if (IsHost() && !State.PanicMode && callId == (uint8_t)RpcCalls__Enum::CloseDoorsOfType &&
             State.DisabledSabotageTypes.count((int)SystemTypes__Enum::Doors))
             return;
