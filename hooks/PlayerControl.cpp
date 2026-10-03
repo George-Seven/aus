@@ -24,51 +24,36 @@ struct PlayerActivityInfo {
 
 std::unordered_map<int, PlayerActivityInfo> playerActivityMap;
 
-namespace FirstMeetingCooldown
-{
-    constexpr float Duration = 45.0f;
+namespace FirstMeetingCooldown {
+    constexpr float COOLDOWN_SECONDS = 45.0f;
 
-    static float BlockUntil = -1.0f;
-    static int32_t GameId = -1;
+    static std::chrono::steady_clock::time_point gameStartTime{};
+    static bool timerActive = false;
 
-    inline void Start()
-    {
-        if (!State.FirstMeetingCooldown || !IsHost())
-        {
-            BlockUntil = -1.0f;
-            GameId = -1;
-            return;
+    inline void Start() {
+        gameStartTime = std::chrono::steady_clock::now();
+        timerActive = true;
+    }
+
+    inline void Reset() {
+        timerActive = false;
+    }
+
+    inline bool IsBlocked() {
+        if (!timerActive)
+            return false;
+
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::duration<float>>(
+                std::chrono::steady_clock::now() - gameStartTime
+            ).count();
+
+        if (elapsed >= COOLDOWN_SECONDS) {
+            timerActive = false;
+            return false;
         }
 
-        if (*Game::pAmongUsClient == nullptr)
-            return;
-
-        int32_t currentGameId = (*Game::pAmongUsClient)->fields._.GameId;
-
-        // OnGameStart is called for multiple PlayerControl objects.
-        // Only start the timer once for each game.
-        if (GameId == currentGameId && BlockUntil >= 0.0f)
-            return;
-
-        GameId = currentGameId;
-        BlockUntil = app::Time_get_time(nullptr) + Duration;
-    }
-
-    inline bool IsBlocked()
-    {
-        if (!State.FirstMeetingCooldown || !IsHost())
-            return false;
-
-        if (BlockUntil < 0.0f)
-            return false;
-
-        return app::Time_get_time(nullptr) < BlockUntil;
-    }
-
-    inline void Reset()
-    {
-        BlockUntil = -1.0f;
-        GameId = -1;
+        return true;
     }
 }
 
@@ -984,13 +969,24 @@ bool dPlayerControl_get_CanMove(PlayerControl* __this, MethodInfo* method) {
 
 void dPlayerControl_OnGameStart(PlayerControl* __this, MethodInfo* method) {
     if (State.ShowHookLogs) Log.HookDebug("Hook dPlayerControl_OnGameStart executed", false);
+
     try {
         State.GameLoaded = true;
 
-        // Start the host-side 45 second emergency-meeting cooldown.
-        // Start() internally makes sure it only starts once per game.
-        if (IsHost()) {
-            FirstMeetingCooldown::Start();
+        /*
+         * First 45 seconds:
+         * - Emergency/button meetings are blocked.
+         * - Dead-body reports remain allowed.
+         *
+         * This is host-side, so the host enforces it for all players.
+         */
+        if (__this == *Game::pLocalPlayer && IsHost()) {
+            if (State.FirstMeetingCooldown) {
+                FirstMeetingCooldown::Start();
+            }
+            else {
+                FirstMeetingCooldown::Reset();
+            }
         }
 
         if (State.Overflow && __this == *Game::pLocalPlayer &&
@@ -1010,18 +1006,39 @@ void dPlayerControl_OnGameStart(PlayerControl* __this, MethodInfo* method) {
 
         if (IsHost() && State.BattleRoyale) {
             for (auto p : GetAllPlayerControl()) {
-                if (p != *Game::pLocalPlayer) RoleManager_SetRole(Game::RoleManager.GetInstance(), p, RoleTypes__Enum::Crewmate, NULL);
+                if (p != *Game::pLocalPlayer)
+                    RoleManager_SetRole(
+                        Game::RoleManager.GetInstance(),
+                        p,
+                        RoleTypes__Enum::Crewmate,
+                        NULL
+                    );
             }
         }
 
-        if (IsHost() && State.SpectatorMode && (GetNormalPlayerTasks(*Game::pLocalPlayer).size() != 0 || GetPlayerData(*Game::pLocalPlayer)->fields.RoleType != RoleTypes__Enum::CrewmateGhost)) {
-            PlayerControl_RpcSetRole(*Game::pLocalPlayer, RoleTypes__Enum::ImpostorGhost, false, NULL);
-            PlayerControl_RpcSetRole(*Game::pLocalPlayer, RoleTypes__Enum::CrewmateGhost, false, NULL);
+        if (IsHost() && State.SpectatorMode &&
+            (GetNormalPlayerTasks(*Game::pLocalPlayer).size() != 0 ||
+             GetPlayerData(*Game::pLocalPlayer)->fields.RoleType != RoleTypes__Enum::CrewmateGhost)) {
+
+            PlayerControl_RpcSetRole(
+                *Game::pLocalPlayer,
+                RoleTypes__Enum::ImpostorGhost,
+                false,
+                NULL
+            );
+
+            PlayerControl_RpcSetRole(
+                *Game::pLocalPlayer,
+                RoleTypes__Enum::CrewmateGhost,
+                false,
+                NULL
+            );
         }
     }
     catch (...) {
         LOG_ERROR("Exception occurred in PlayerControl_OnGameStart (PlayerControl)");
     }
+
     PlayerControl_OnGameStart(__this, method);
 }
 
@@ -1258,18 +1275,6 @@ void dPlayerControl_StartMeeting(PlayerControl* __this, NetworkedPlayerInfo* tar
     State.BlinkPlayersTab = true;
     if (Object_1_IsNull((Object_1*)*Game::pShipStatus)) return;
     try {
-
-        // First 45 seconds:
-        // block emergency/button meetings only.
-        // target == nullptr means this is an emergency meeting.
-        // Dead-body reports have a non-null target and remain allowed.
-        if (IsHost() &&
-            target == nullptr &&
-            FirstMeetingCooldown::IsBlocked())
-        {
-            return;
-        }
-
         if (!State.PanicMode && IsHost() && (State.DisableMeetings || (State.BattleRoyale || State.TaskSpeedrun))) {
             return;
         }
@@ -1330,17 +1335,6 @@ void dPlayerControl_HandleRpc(PlayerControl* __this, uint8_t callId, MessageRead
         if (Object_1_IsNull((Object_1*)*Game::pShipStatus) && (callId == (uint8_t)RpcCalls__Enum::ReportDeadBody || callId == (uint8_t)RpcCalls__Enum::StartMeeting ||
                 callId == (uint8_t)RpcCalls__Enum::CloseDoorsOfType || callId == (uint8_t)RpcCalls__Enum::UpdateSystem))
             return;
-        
-        // First 45 seconds:
-        // block emergency/button meeting RPCs from EVERY player.
-        // Do NOT block ReportDeadBody.
-        if (IsHost() &&
-            callId == (uint8_t)RpcCalls__Enum::StartMeeting &&
-            FirstMeetingCooldown::IsBlocked())
-        {
-            return;
-        }
-        
         if (IsHost() && ((((!State.PanicMode && State.DisableMeetings) || (State.BattleRoyale || State.TaskSpeedrun)) &&
             (callId == (uint8_t)RpcCalls__Enum::ReportDeadBody || callId == (uint8_t)RpcCalls__Enum::StartMeeting)) ||
             ((State.DisableSabotages || (State.BattleRoyale || State.TaskSpeedrun)) &&
@@ -1457,17 +1451,56 @@ void dGameObject_SetActive(GameObject* __this, bool value, MethodInfo* method)
     GameObject_SetActive(__this, value, method);
 }
 
-void dPlayerControl_CmdReportDeadBody(PlayerControl* __this, NetworkedPlayerInfo* target, MethodInfo* method) {
-    if (State.ShowHookLogs) Log.HookDebug("Hook dPlayerControl_CmdReportDeadBody executed", false);
+void dPlayerControl_CmdReportDeadBody(
+    PlayerControl* __this,
+    NetworkedPlayerInfo* target,
+    MethodInfo* method)
+{
+    if (State.ShowHookLogs)
+        Log.HookDebug("Hook dPlayerControl_CmdReportDeadBody executed", false);
+
     try {
-        if (!State.PanicMode && IsHost() && (State.DisableMeetings || (State.BattleRoyale || State.TaskSpeedrun))) {
-            return;
+        if (!State.PanicMode && IsHost()) {
+
+            /*
+             * First 45 seconds after game start:
+             *
+             * target == nullptr
+             *     -> emergency/button meeting
+             *
+             * target != nullptr
+             *     -> dead-body report
+             *
+             * Therefore we block ONLY emergency meetings and
+             * continue allowing dead-body reports.
+             */
+            if (State.FirstMeetingCooldown &&
+                target == nullptr &&
+                FirstMeetingCooldown::IsBlocked()) {
+
+                return;
+            }
+
+            /*
+             * Existing SickoMenu meeting restrictions.
+             *
+             * These still apply normally.
+             */
+            if (State.DisableMeetings ||
+                State.BattleRoyale ||
+                State.TaskSpeedrun) {
+
+                return;
+            }
         }
     }
     catch (...) {
         Log.Debug("Exception occurred in CmdReportDeadBody (PlayerControl)");
     }
-    if (Object_1_IsNull((Object_1*)*Game::pShipStatus)) return;
+
+    if (Object_1_IsNull((Object_1*)*Game::pShipStatus))
+        return;
+
     PlayerControl_CmdReportDeadBody(__this, target, method);
 }
 
